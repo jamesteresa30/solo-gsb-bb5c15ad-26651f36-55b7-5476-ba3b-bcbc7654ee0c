@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from . import calibration as cal
 from . import excursions as exc
 from . import incidents as inc
+from . import propagation as prop
 from . import segmentation as seg
 from . import timeline as tl
 from .config import settings
@@ -26,6 +27,8 @@ from .schemas import (
     IncidentBoundaryOut,
     IncidentOut,
     IncidentsOut,
+    PropagationLagOut,
+    PropagationOut,
     ReadingIn,
     SegmentOut,
     SegmentationOut,
@@ -721,6 +724,77 @@ def build_incidents(
                 ],
             )
             for e in selected
+        ],
+    )
+
+
+# ---------- 跨展柜环境传播分析 ----------
+
+
+def build_propagation(
+    db: Session,
+    source_sn: str,
+    target_sn: str,
+    dimension: str,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    step_seconds: float,
+    max_lag_seconds: float,
+    max_gap_seconds: float,
+) -> PropagationOut | tuple[None, str]:
+    """两柜同维读数在重叠时段的时滞相关分析（只读，不落库）。
+
+    任一展柜没有读数时返回 ``(None, sn)``（由上层判 404，先 source 后
+    target）；两柜均存在但重叠时段无有效配对时正常返回，各时滞标记为
+    不可用。
+    """
+    source_samples = _load_samples(db, source_sn)
+    if not source_samples:
+        return None, source_sn
+    target_samples = _load_samples(db, target_sn)
+    if not target_samples:
+        return None, target_sn
+
+    result = prop.analyze_propagation(
+        source_samples,
+        target_samples,
+        source_sn=source_sn,
+        target_sn=target_sn,
+        dimension=dimension,
+        start=start,
+        end=end,
+        step_seconds=step_seconds,
+        max_lag_seconds=max_lag_seconds,
+        max_gap_seconds=max_gap_seconds,
+    )
+    return PropagationOut(
+        source_sn=result.source_sn,
+        target_sn=result.target_sn,
+        dimension=result.dimension,  # type: ignore[arg-type]
+        start=start,
+        end=end,
+        step_seconds=result.step_seconds,
+        max_lag_seconds=result.max_lag_seconds,
+        max_gap_seconds=result.max_gap_seconds,
+        overlap_start=result.overlap_start,
+        overlap_end=result.overlap_end,
+        grid_start=result.grid_start,
+        grid_end=result.grid_end,
+        grid_point_count=result.grid_point_count,
+        source_valid_count=result.source_valid_count,
+        target_valid_count=result.target_valid_count,
+        available=result.available,
+        best_lag_seconds=result.best_lag_seconds,
+        direction=result.direction,  # type: ignore[arg-type]
+        best_correlation=result.best_correlation,
+        lags=[
+            PropagationLagOut(
+                lag_seconds=item.lag_seconds,
+                sample_count=item.sample_count,
+                available=item.available,
+                correlation=item.correlation,
+            )
+            for item in result.lags
         ],
     )
 

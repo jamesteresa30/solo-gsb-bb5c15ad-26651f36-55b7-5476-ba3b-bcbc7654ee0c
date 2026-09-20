@@ -265,6 +265,86 @@ class ExposureBudgetOut(BaseModel):
 IncidentDirection = Literal["up", "down", "flat"]
 
 
+PropagationDirection = Literal[
+    "source_to_target", "target_to_source", "synchronous"
+]
+
+
+class PropagationLagOut(BaseModel):
+    lag_seconds: float = Field(
+        ...,
+        description=(
+            "时滞（秒）；正值表示 source 领先 target，即 source(t) 与 "
+            "target(t+lag) 配对"
+        ),
+    )
+    sample_count: int = Field(
+        ..., description="该时滞下两侧都有效的成对数（仅这些点参与相关）"
+    )
+    available: bool = Field(
+        ..., description="相关系数是否可用（样本不足或常量序列时为 false）"
+    )
+    correlation: float | None = Field(
+        None,
+        description="皮尔逊相关系数 [−1, 1]；不可用时为 null（不产生 NaN）",
+    )
+
+
+class PropagationOut(BaseModel):
+    source_sn: str
+    target_sn: str
+    dimension: ExcursionDimension = Field(
+        ..., description="分析维度：temperature 或 humidity"
+    )
+    start: dt.datetime | None = Field(
+        None, description="实际生效的起始过滤（UTC），未指定为 null"
+    )
+    end: dt.datetime | None = Field(
+        None, description="实际生效的结束过滤（UTC），未指定为 null"
+    )
+    step_seconds: float = Field(..., description="规则网格步长（秒）")
+    max_lag_seconds: float = Field(..., description="枚举时滞的最大绝对值（秒，含端点）")
+    max_gap_seconds: float = Field(
+        ..., description="相邻读数间隔超过该值（秒）时插值点无效"
+    )
+    overlap_start: dt.datetime | None = Field(
+        None, description="两柜读数时间范围（与查询窗交集）的重叠起点"
+    )
+    overlap_end: dt.datetime | None = Field(
+        None, description="两柜读数时间范围（与查询窗交集）的重叠终点"
+    )
+    grid_start: dt.datetime | None = Field(
+        None, description="首个网格点时刻（重叠起点 ceil 对齐到步长）；无网格为 null"
+    )
+    grid_end: dt.datetime | None = Field(None, description="末个网格点时刻；无网格为 null")
+    grid_point_count: int = Field(..., description="重叠时段上的网格点总数")
+    source_valid_count: int = Field(..., description="source 侧有效的网格点数")
+    target_valid_count: int = Field(..., description="target 侧有效的网格点数")
+    available: bool = Field(
+        ..., description="是否至少有一个时滞得到可用相关系数"
+    )
+    best_lag_seconds: float | None = Field(
+        None,
+        description=(
+            "最佳时滞（秒）；按 |相关| → 有效样本数 → 时滞绝对值 → 时滞值"
+            " 依次择优；全部不可用时为 null"
+        ),
+    )
+    direction: PropagationDirection | None = Field(
+        None,
+        description=(
+            "传播方向：正时滞 source_to_target（source 领先），"
+            "负时滞 target_to_source，零时滞 synchronous；不可用时为 null"
+        ),
+    )
+    best_correlation: float | None = Field(
+        None, description="最佳时滞对应的皮尔逊相关系数；不可用时为 null"
+    )
+    lags: list[PropagationLagOut] = Field(
+        ..., description="各时滞明细，按时滞值升序（负 → 正）排列"
+    )
+
+
 class IncidentBoundaryOut(BaseModel):
     device_sn: str
     ts: dt.datetime = Field(..., description="该展柜非基线段段首（突变发生时刻）")

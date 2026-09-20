@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
@@ -25,6 +26,7 @@ from .schemas import (
     IncidentsOut,
     IngestResponse,
     IngestSummary,
+    PropagationOut,
     ReadingIn,
     ReplayPreviewResponse,
     SegmentationOut,
@@ -55,10 +57,11 @@ app = FastAPI(
         "确定性变点分段；合并同序号重复上报，支持迟到读数补入后的"
         "时间线重放、锚点校准与无写库重放预览；并提供基于线性插值的"
         "越界剂量（excursion dose）事件查询与分维累计剂量预算"
-        "（exposure budget）耗尽时刻反解，以及基于已对齐锚点参考值的"
-        "分维偏移校正时间线（只读）。"
+        "（exposure budget）耗尽时刻反解，基于已对齐锚点参考值的"
+        "分维偏移校正时间线（只读），以及跨展柜重叠时段的"
+        "环境传播（propagation）时滞相关分析。"
     ),
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -414,6 +417,92 @@ def get_incidents(
         tolerance_seconds=tolerance_seconds,
         min_devices=min_devices,
     )
+
+
+# ---------- 跨展柜环境传播分析 ----------
+
+
+@app.get(
+    "/api/v1/propagation",
+    response_model=PropagationOut,
+    tags=["propagation"],
+    summary="跨展柜环境传播分析：重叠时段固定步长插值 + 时滞皮尔逊相关",
+)
+def get_propagation(
+    source_sn: str = Query(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="传播源展柜序号（正时滞表示该柜领先）",
+    ),
+    target_sn: str = Query(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="传播目标展柜序号",
+    ),
+    dimension: Literal["temperature", "humidity"] = Query(
+        ..., description="分析维度：temperature 或 humidity"
+    ),
+    start: dt.datetime | None = Query(None, description="起始时间（含），ISO8601"),
+    end: dt.datetime | None = Query(None, description="结束时间（含），ISO8601"),
+    step_seconds: float = Query(
+        ...,
+        gt=0.0,
+        le=86400.0,
+        description="重叠时段规则网格步长（秒，必须为正）",
+    ),
+    max_lag_seconds: float = Query(
+        ...,
+        gt=0.0,
+        le=604800.0,
+        description="枚举时滞的最大绝对值（秒，含端点；必须为正）",
+    ),
+    max_gap_seconds: float = Query(
+        ...,
+        gt=0.0,
+        le=86400.0,
+        description="相邻读数间隔超过该值时插值点无效（秒，必须为正）",
+    ),
+    db: Session = Depends(get_db),
+):
+    start_utc = _parse_ts(start)
+    end_utc = _parse_ts(end)
+    if start_utc is not None and end_utc is not None and start_utc > end_utc:
+        raise HTTPException(status_code=422, detail="start 不能晚于 end")
+    if source_sn == target_sn:
+        raise HTTPException(status_code=422, detail="source_sn 与 target_sn 不能相同")
+    if max_lag_seconds < step_seconds:
+        raise HTTPException(
+            status_code=422,
+            detail="max_lag_seconds 不能小于 step_seconds（否则没有可枚举的时滞格点）",
+        )
+    # 时滞只枚举步长整数倍；非整数倍参数必须能精确落在步长格点上，
+    # 避免静默截断导致的枚举范围歧义（允许 1e-6 相对浮点误差）
+    ratio = max_lag_seconds / step_seconds
+    if abs(ratio - round(ratio)) > 1e-6:
+        raise HTTPException(
+            status_code=422,
+            detail="max_lag_seconds 必须是 step_seconds 的整数倍",
+        )
+
+    out = services.build_propagation(
+        db,
+        source_sn,
+        target_sn,
+        dimension,
+        start_utc,
+        end_utc,
+        step_seconds,
+        max_lag_seconds,
+        max_gap_seconds,
+    )
+    if isinstance(out, tuple):
+        _, missing_sn = out
+        raise HTTPException(
+            status_code=404, detail=f"展柜不存在或尚无读数: {missing_sn}"
+        )
+    return out
 
 
 # ---------- 锚点校准 ----------
