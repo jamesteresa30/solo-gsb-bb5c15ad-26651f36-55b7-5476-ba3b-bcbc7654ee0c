@@ -300,6 +300,68 @@ class IncidentsOut(BaseModel):
     incidents: list[IncidentOut]
 
 
+PropagationDimension = Literal["temperature", "humidity"]
+PropagationDirection = Literal[
+    "source_to_target",  # 最佳时滞 > 0：source 领先 target
+    "target_to_source",  # 最佳时滞 < 0：target 领先 source
+    "synchronous",       # 最佳时滞 = 0：同步
+    "unavailable",       # 没有任何可用时滞
+]
+
+
+class PropagationLagOut(BaseModel):
+    lag_seconds: float = Field(
+        ..., description="时滞（秒）：正值表示 source 领先 target，含 0，按 step 等距枚举"
+    )
+    available: bool = Field(..., description="该时滞是否得到有效相关系数")
+    pair_count: int = Field(..., description="参与相关计算的成对有效点数")
+    correlation: float | None = Field(
+        None, description="皮尔逊相关系数；不可用（样本不足/常量序列/无重叠）时为 null"
+    )
+    reason: str | None = Field(
+        None,
+        description="不可用原因：no_overlap / insufficient_samples / constant_series",
+    )
+
+
+class PropagationOut(BaseModel):
+    source_sn: str
+    target_sn: str
+    dimension: PropagationDimension
+    start: dt.datetime = Field(..., description="实际生效的起始时间（UTC）")
+    end: dt.datetime = Field(..., description="实际生效的结束时间（UTC）")
+    overlap_start: dt.datetime | None = Field(
+        None, description="两柜读数覆盖范围与查询窗交集的起点（无重叠为 null）"
+    )
+    overlap_end: dt.datetime | None = Field(
+        None, description="两柜读数覆盖范围与查询窗交集的终点（无重叠为 null）"
+    )
+    step_seconds: float
+    max_lag_seconds: float
+    max_gap_seconds: float = Field(
+        ..., description="允许的最大相邻读数间隔（秒）；超过则该插值点无效"
+    )
+    grid_point_count: int = Field(..., description="重叠时段内固定步长网格点数")
+    source_valid_count: int = Field(..., description="source 侧有效插值点数")
+    target_valid_count: int = Field(..., description="target 侧有效插值点数")
+    lags: list[PropagationLagOut] = Field(
+        ..., description="各枚举时滞的明细，按时滞升序排列（含 0）"
+    )
+    best_lag_seconds: float | None = Field(
+        None, description="最佳时滞（秒）；无可用时滞时为 null"
+    )
+    best_correlation: float | None = Field(
+        None, description="最佳时滞对应的皮尔逊相关系数；无可用时滞时为 null"
+    )
+    direction: PropagationDirection = Field(
+        ...,
+        description=(
+            "传播方向：source_to_target（source 领先）/ target_to_source"
+            "（target 领先）/ synchronous（零时滞）/ unavailable（不可用）"
+        ),
+    )
+
+
 class HealthOut(BaseModel):
     status: str
     db: str

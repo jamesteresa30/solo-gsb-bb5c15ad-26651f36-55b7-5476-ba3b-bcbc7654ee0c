@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from . import calibration as cal
 from . import excursions as exc
 from . import incidents as inc
+from . import propagation as prop
 from . import segmentation as seg
 from . import timeline as tl
 from .config import settings
@@ -26,6 +27,8 @@ from .schemas import (
     IncidentBoundaryOut,
     IncidentOut,
     IncidentsOut,
+    PropagationLagOut,
+    PropagationOut,
     ReadingIn,
     SegmentOut,
     SegmentationOut,
@@ -722,6 +725,80 @@ def build_incidents(
             )
             for e in selected
         ],
+    )
+
+
+# ---------- 跨展柜环境传播分析 ----------
+
+
+def _case_has_readings(db: Session, device_sn: str) -> bool:
+    return (
+        db.scalar(
+            select(func.count(Reading.id)).where(Reading.device_sn == device_sn)
+        )
+        or 0
+    ) > 0
+
+
+def build_propagation(
+    db: Session,
+    source_sn: str,
+    target_sn: str,
+    dimension: str,
+    start: dt.datetime,
+    end: dt.datetime,
+    step_seconds: float,
+    max_lag_seconds: float,
+    max_gap_seconds: float,
+) -> PropagationOut | None:
+    """两展柜重叠时段的分维固定步长插值、时滞枚举与皮尔逊相关（只读）。
+
+    任一展柜没有任何读数时返回 ``None``（由上层判 404）。两柜在查询窗内
+    无重叠、或全部时滞样本不足/常量时，相关字段为 ``null``、方向为
+    ``unavailable``，不产生 NaN。
+    """
+    source_samples = _load_samples(db, source_sn)
+    target_samples = _load_samples(db, target_sn)
+    if not source_samples or not target_samples:
+        return None
+
+    result = prop.compute_propagation(
+        source_samples,
+        target_samples,
+        dimension=dimension,
+        start=start,
+        end=end,
+        step_seconds=step_seconds,
+        max_lag_seconds=max_lag_seconds,
+        max_gap_seconds=max_gap_seconds,
+    )
+    return PropagationOut(
+        source_sn=source_sn,
+        target_sn=target_sn,
+        dimension=result.dimension,
+        start=result.start,
+        end=result.end,
+        overlap_start=result.overlap_start,
+        overlap_end=result.overlap_end,
+        step_seconds=result.step_seconds,
+        max_lag_seconds=result.max_lag_seconds,
+        max_gap_seconds=result.max_gap_seconds,
+        grid_point_count=result.grid_point_count,
+        source_valid_count=result.source_valid_count,
+        target_valid_count=result.target_valid_count,
+        lags=[
+            PropagationLagOut(
+                lag_seconds=item.lag_seconds,
+                available=item.available,
+                pair_count=item.pair_count,
+                correlation=item.correlation,
+                reason=item.reason,
+            )
+            for item in result.lags
+        ],
+        best_lag_seconds=result.best_lag_seconds,
+        best_correlation=result.best_correlation,
+        direction=result.direction,
     )
 
 

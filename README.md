@@ -6,8 +6,9 @@
 读数补入后的时间线重放、锚点校准与“不落库”的重放预览；并提供基于
 **线性插值阈值交点**的越界剂量（excursion dose）事件查询、分维**累计剂量
 预算**（exposure budget）耗尽时刻反解、基于各展柜非基线段首的**跨展柜
-共模突变**（common-mode incident）检测，以及基于已对齐锚点参考值的
-**分维偏移校正时间线**（只读）。
+共模突变**（common-mode incident）检测、基于已对齐锚点参考值的
+**分维偏移校正时间线**（只读），以及基于固定步长插值与正负时滞
+皮尔逊相关的**跨展柜环境传播分析**（propagation，只读）。
 
 ---
 
@@ -187,6 +188,45 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 （`calibrated_* = 原值 + 偏移`）。设备没有读数返回 `404`，
 `start` 晚于 `end` 返回 `422`，过滤后为空范围返回 `200` 与空序列。
 
+### 10. 跨展柜环境传播分析
+
+`GET /api/v1/propagation` 在两个展柜（`source_sn` / `target_sn`）的
+**重叠时段**内，对指定维度（`temperature` / `humidity`）做固定步长
+重采样，枚举一组正负时滞并逐档计算皮尔逊相关，用以判断环境变化从哪个
+展柜传播而来、领先多少秒：
+
+1. 分析时段取查询窗 `[start, end]` 与两柜读数覆盖范围的**交集**；
+2. 在重叠时段上按 `step_seconds` 生成**等距网格**（从重叠起点起，不足
+   一个步长的尾部不补点），两柜曲线各自在网格点上按相邻读数**线性
+   插值**；
+3. 网格点所依赖的相邻读数间隔**大于** `max_gap_seconds` 时该点判为
+   **无效**（恰好等于 `max_gap` 仍连续）；落在某柜覆盖范围外的点同样
+   无效；
+4. 时滞按 `step_seconds` 的整数倍枚举，范围
+   `[-max_lag_seconds, +max_lag_seconds]`（含 0）。**正时滞表示 source
+   领先 target**：比较 source 在 `t` 与 target 在 `t + lag` 的插值；
+5. 每个时滞只使用两侧**同时有效的成对点**计算皮尔逊相关：成对点数少于
+   2、或任一成对序列为常量（方差为 0）时该时滞标记为**不可用**，
+   `correlation` 为 `null` 并给出 `reason`
+   （`no_overlap` / `insufficient_samples` / `constant_series`），
+   **任何情况下都不产生 NaN**。
+
+各时滞明细 `lags` 按时滞升序返回。最佳时滞按以下次序**依次择优**：
+
+1. 相关系数**绝对值更大**；
+2. 并列时**有效成对点数更多**；
+3. 仍并列时**时滞绝对值更小**；
+4. 完全并列时**时滞值更小**（正负并列取负）。
+
+`direction` 取 `source_to_target`（最佳时滞 > 0，source 领先）、
+`target_to_source`（< 0，target 领先）、`synchronous`（= 0，同步）；
+没有任何可用时滞时为 `unavailable`，最佳时滞与相关系数为 `null`。
+
+`source_sn` 与 `target_sn` 相同、`start` 晚于 `end`、`step_seconds ≤ 0`、
+`max_lag_seconds < 0`、`max_gap_seconds ≤ 0`、维度非法均返回 `422`；
+任一展柜没有读数返回 `404`；两柜无重叠或全部时滞不可用时返回 `200` 与
+`direction=unavailable`。接口**只读**，不写库、不改版本号。
+
 ---
 
 ## 接口一览
@@ -201,6 +241,7 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 | GET  | `/api/v1/cases/{sn}/exposure-budget` | 累计越界剂量预算：窗末累计量、剩余额度与首次达到预算的精确时刻 |
 | GET  | `/api/v1/cases/{sn}/calibrated-timeline` | 锚点参考值校正的只读时间线：分维偏移线性插值，支持 `start` / `end` 过滤 |
 | GET  | `/api/v1/incidents` | 跨展柜共模突变：非基线段首候选窗 + 全局最优互不重叠选择 |
+| GET  | `/api/v1/propagation` | 跨展柜环境传播：重叠时段固定步长插值 + 正负时滞皮尔逊相关（只读） |
 | POST | `/api/v1/anchors` | 登记/更新锚点并重放 |
 | GET  | `/api/v1/cases/{sn}/anchors` | 查询锚点及对齐情况 |
 | DELETE | `/api/v1/cases/{sn}/anchors/{ts}` | 删除锚点并重放 |
@@ -514,6 +555,58 @@ curl 'http://localhost:8080/api/v1/cases/CASE-007/calibrated-timeline?start=2026
 不修改读数、分段或版本号。设备没有读数返回 `404`，`start` 晚于 `end`
 返回 `422`，过滤后为空范围返回 `200` 与空序列。
 
+### 跨展柜环境传播分析
+
+```bash
+curl 'http://localhost:8080/api/v1/propagation?source_sn=CASE-A&target_sn=CASE-B&dimension=temperature&start=2026-09-01T00:00:00Z&end=2026-09-01T01:00:00Z&step_seconds=60&max_lag_seconds=300&max_gap_seconds=600'
+```
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `source_sn` / `target_sn` | 是 | 源 / 目标展柜序号；二者相同返回 `422`，任一无读数返回 `404` |
+| `dimension` | 是 | `temperature` 或 `humidity` |
+| `start` / `end` | 是 | 含端点的 ISO8601 时间窗；实际网格取它与两柜覆盖范围的交集 |
+| `step_seconds` | 是 | 固定插值网格步长（秒，**> 0**）；时滞按其整数倍枚举 |
+| `max_lag_seconds` | 是 | 枚举时滞的最大绝对值（秒，**≥ 0**）；正时滞表示 source 领先 target |
+| `max_gap_seconds` | 是 | 允许的最大相邻读数间隔（秒，**> 0**）；超过则该插值点无效 |
+
+响应示例（target 的温度曲线整体落后 source 2 分钟，最佳时滞 `+120s`，
+方向 `source_to_target`）：
+
+```json
+{
+  "source_sn": "CASE-A",
+  "target_sn": "CASE-B",
+  "dimension": "temperature",
+  "start": "2026-09-01T00:00:00Z",
+  "end": "2026-09-01T01:00:00Z",
+  "overlap_start": "2026-09-01T00:02:00Z",
+  "overlap_end": "2026-09-01T00:11:00Z",
+  "step_seconds": 60.0,
+  "max_lag_seconds": 300.0,
+  "max_gap_seconds": 600.0,
+  "grid_point_count": 10,
+  "source_valid_count": 10,
+  "target_valid_count": 10,
+  "lags": [
+    {"lag_seconds": -300.0, "available": true, "pair_count": 5, "correlation": -0.7613188819880644, "reason": null},
+    {"lag_seconds": 0.0, "available": true, "pair_count": 10, "correlation": 0.31556038781189183, "reason": null},
+    {"lag_seconds": 60.0, "available": true, "pair_count": 9, "correlation": 0.49753210985780466, "reason": null},
+    {"lag_seconds": 120.0, "available": true, "pair_count": 8, "correlation": 1.0, "reason": null}
+  ],
+  "best_lag_seconds": 120.0,
+  "best_correlation": 1.0,
+  "direction": "source_to_target"
+}
+```
+
+`lags` 仅节录；实际按时滞升序给出从 `-max_lag_seconds` 到
+`+max_lag_seconds` 的全部档位。不可用档位形如
+`{"lag_seconds": 300.0, "available": false, "pair_count": 1,
+"correlation": null, "reason": "insufficient_samples"}`；
+两柜无重叠时所有档位的 `reason` 为 `no_overlap`，且
+`grid_point_count=0`、`direction="unavailable"`。
+
 ---
 
 ## 配置（环境变量）
@@ -555,4 +648,8 @@ python -m pytest -q
 起始时间序列并列规则、严格互不重叠、方向判定、参数校验 422 与空库/空范围），以及
 **锚点参考值校正时间线**（分维偏移独立成曲线、相邻锚点线性插值与首尾常数外推、
 缺维参考值锚点不参与该维、同读数多锚点取最后一个有效参考值、先建曲线再按
-start/end 过滤、无有效锚点偏移为 0、未对齐锚点忽略、只读不改库、404/422/空范围）。
+start/end 过滤、无有效锚点偏移为 0、未对齐锚点忽略、只读不改库、404/422/空范围），以及
+**跨展柜环境传播分析**（重叠时段固定步长网格与尾部不补点、相邻读数线性插值、
+`max_gap` 断档点无效与等于连续、正负时滞枚举与时滞符号约定、只数成对有效点、
+样本不足/常量序列标不可用且不产生 NaN、按 |r|→成对点数→|lag|→lag 择优、
+方向判定、无重叠 200 unavailable、422/404 参数校验、确定性）。

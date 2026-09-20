@@ -25,6 +25,7 @@ from .schemas import (
     IncidentsOut,
     IngestResponse,
     IngestSummary,
+    PropagationOut,
     ReadingIn,
     ReplayPreviewResponse,
     SegmentationOut,
@@ -56,9 +57,10 @@ app = FastAPI(
         "时间线重放、锚点校准与无写库重放预览；并提供基于线性插值的"
         "越界剂量（excursion dose）事件查询与分维累计剂量预算"
         "（exposure budget）耗尽时刻反解，以及基于已对齐锚点参考值的"
-        "分维偏移校正时间线（只读）。"
+        "分维偏移校正时间线（只读）；并支持跨展柜共模突变检测与基于"
+        "固定步长插值、正负时滞皮尔逊相关的跨展柜环境传播分析（只读）。"
     ),
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -413,6 +415,66 @@ def get_incidents(
         end_utc,
         tolerance_seconds=tolerance_seconds,
         min_devices=min_devices,
+    )
+
+
+# ---------- 跨展柜环境传播分析 ----------
+
+
+@app.get(
+    "/api/v1/propagation",
+    response_model=PropagationOut,
+    tags=["propagation"],
+    summary="跨展柜环境传播：重叠时段固定步长插值 + 正负时滞皮尔逊相关",
+)
+def get_propagation(
+    source_sn: str = Query(
+        ..., min_length=1, max_length=64, description="源展柜设备序号（领先方候选）"
+    ),
+    target_sn: str = Query(
+        ..., min_length=1, max_length=64, description="目标展柜设备序号"
+    ),
+    dimension: str = Query(
+        ...,
+        pattern="^(temperature|humidity)$",
+        description="分析维度：temperature（温度）/ humidity（湿度）",
+    ),
+    start: dt.datetime = Query(..., description="起始时间（含），ISO8601"),
+    end: dt.datetime = Query(..., description="结束时间（含），ISO8601"),
+    step_seconds: float = Query(
+        ..., gt=0.0, description="固定插值网格步长（秒，必须为正）"
+    ),
+    max_lag_seconds: float = Query(
+        ..., ge=0.0, description="枚举时滞的最大绝对值（秒，非负）；正时滞表示 source 领先 target"
+    ),
+    max_gap_seconds: float = Query(
+        ..., gt=0.0, description="允许的最大相邻读数间隔（秒）；超过则该插值点无效"
+    ),
+    db: Session = Depends(get_db),
+):
+    if source_sn == target_sn:
+        raise HTTPException(status_code=422, detail="source_sn 不能与 target_sn 相同")
+
+    start_utc = _parse_ts(start)
+    end_utc = _parse_ts(end)
+    if start_utc > end_utc:
+        raise HTTPException(status_code=422, detail="start 不能晚于 end")
+
+    if not services._case_has_readings(db, source_sn):
+        raise HTTPException(status_code=404, detail=f"展柜不存在或尚无读数: {source_sn}")
+    if not services._case_has_readings(db, target_sn):
+        raise HTTPException(status_code=404, detail=f"展柜不存在或尚无读数: {target_sn}")
+
+    return services.build_propagation(
+        db,
+        source_sn=source_sn,
+        target_sn=target_sn,
+        dimension=dimension,
+        start=start_utc,
+        end=end_utc,
+        step_seconds=step_seconds,
+        max_lag_seconds=max_lag_seconds,
+        max_gap_seconds=max_gap_seconds,
     )
 
 
